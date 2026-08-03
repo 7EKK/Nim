@@ -1,0 +1,101 @@
+name: Build Nim for Windows
+
+on:
+  push:
+    branches:
+      - devel
+  pull_request:
+    branches:
+      - devel
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x64:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Cache the bootstrap compiler
+        uses: actions/cache@v6
+        with:
+          path: |
+            csources_v3
+            bin/nim_csources_*.exe
+          key: nim-csources-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('config/build_config.txt') }}
+
+      - name: Show the build toolchain
+        shell: pwsh
+        run: |
+          git rev-parse HEAD
+          git --version
+          gcc --version
+          where.exe gcc
+
+      - name: Build Nim and bundled tools
+        shell: cmd
+        run: call build_all.bat
+
+      - name: Smoke-test the compiler
+        shell: pwsh
+        run: |
+          .\bin\nim.exe --version
+
+          @'
+          echo "Nim Windows build is working"
+          '@ | Set-Content -Encoding utf8 smoke_test.nim
+
+          .\bin\nim.exe c -d:release --hints:off --warnings:off -r smoke_test.nim
+
+      - name: Create a portable Windows package
+        id: package
+        shell: pwsh
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 12)
+          $name = "nim-windows-x64-$shortSha"
+          $artifactDir = Join-Path $PWD "artifact"
+          $packageRoot = Join-Path $artifactDir $name
+          $zipPath = Join-Path $artifactDir "$name.zip"
+
+          New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
+
+          Copy-Item -Path @("bin", "config", "lib") -Destination $packageRoot -Recurse -Force
+          Copy-Item -Path @("copying.txt", "readme.md") -Destination $packageRoot -Force
+
+          # The bootstrap compiler is only needed during the workflow build.
+          Remove-Item (Join-Path $packageRoot "bin\nim_csources_*.exe") -ErrorAction SilentlyContinue
+
+          "${{ github.sha }}" | Set-Content -NoNewline (Join-Path $packageRoot "COMMIT.txt")
+
+          # Verify that the staged package resolves its own config and standard library.
+          $packagedNim = Join-Path $packageRoot "bin\nim.exe"
+          & $packagedNim --version
+          & $packagedNim c -d:release --hints:off --warnings:off `
+            "-o:$env:RUNNER_TEMP\nim-packaged-smoke.exe" smoke_test.nim
+
+          Compress-Archive -Path $packageRoot -DestinationPath $zipPath -CompressionLevel Optimal
+
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "path=$zipPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload the Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
